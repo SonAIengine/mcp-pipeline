@@ -1,57 +1,140 @@
+<div align="center">
+
 # mcp-pipeline
 
-Stateful Pipeline framework for MCP servers.
+**Stateful Pipeline framework for MCP servers.**
 
-Type-safe state sharing between tools. Declarative dependencies. Fewer tools, fewer tokens.
+Type-safe state. Declarative tool chaining. Fewer tools, fewer tokens.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 
+English · [한국어](README-ko.md)
+
+</div>
+
+---
+
 ## The Problem
 
-MCP servers expose tools to LLM agents. But every tool call costs tokens:
+MCP servers have a token problem. Every time an LLM calls a tool, the **entire list of tool descriptions** is sent in the system prompt. More tools = more tokens = more cost = worse accuracy.
 
+Here's what actually happens when you connect a few MCP servers to Claude:
+
+| Setup | Tool descriptions | % of 200k context |
+|-------|------------------:|-------------------:|
+| GitHub MCP alone (93 tools) | ~55,000 tokens | 27.5% |
+| 7 MCP servers average | ~67,300 tokens | 33.7% |
+| 5 servers × 30 tools each | ~60,000 tokens | 30.0% |
+
+**A third of your context window — gone before the conversation even starts.** And it gets worse: every round trip re-sends all of this.
+
+But the token waste doesn't stop at tool descriptions. Tools also can't share state:
+
+```python
+# FastMCP — each tool is isolated
+@server.tool()
+async def search_products(query: str) -> dict:
+    results = await db.search(query)
+    return {"products": results}  # 500 tokens of product data
+
+@server.tool()
+async def buy_product(product_id: str) -> dict:
+    # Where is this product_id from? The LLM has to relay it.
+    # That means the 500 tokens of search results live in the LLM context
+    # and get re-sent on this call.
+    ...
 ```
-System prompt loads ALL tool descriptions → every round trip
-14 tools × 9 round trips = massive token waste
-```
 
-Real numbers from the ecosystem:
-- GitHub MCP (93 tools): **~55,000 tokens** per call just for tool descriptions
-- Average setup with 7 MCP servers: **67,300 tokens** (33.7% of context window)
-- Each additional round trip re-sends the entire conversation + all tool descriptions
-
-And tools can't share state. If `search` finds results, `execute` can't access them — the LLM has to relay everything through its context, wasting more tokens.
+The LLM becomes a data relay. It receives search results (500 tokens), stores them in its context, then passes the relevant bits to the next tool. **Every piece of data flows through the LLM — even when it doesn't need to.**
 
 ## The Solution
 
-**Collapse many small tools into few pipeline tools. Let the server manage state.**
+Two ideas:
+
+1. **Fewer tools** — collapse 5 small tools into 1 pipeline tool that does multiple things internally
+2. **Server-side state** — let the server cache data between tool calls so the LLM doesn't have to relay it
 
 ```python
 from mcp_pipeline import PipelineMCP, State
+from typing import Any
 
-class MyState(State):
-    results: dict[str, Any] = {}
-    history: list[dict] = []
+# 1. Define typed state
+class ShopState(State):
+    search_results: dict[str, Any] = {}
+    cart: list[dict] = []
 
-server = PipelineMCP("my-server", state=MyState)
+server = PipelineMCP("shop", state=ShopState)
 
-@server.tool(stores="results")
-async def scout(query: str, state: MyState) -> dict:
-    """Search and analyze — does 5 things in one call."""
-    data = await _search(query)
-    analyzed = _analyze(data)
-    return _compress(analyzed)              # Return compressed summary to LLM
+# 2. This tool stores its results in state
+@server.tool(stores="search_results")
+async def search(query: str, state: ShopState) -> dict:
+    """Search products. Results are cached server-side."""
+    products = await db.search(query)
+    # state.search_results is auto-populated with the return value
+    return {
+        "products": [
+            {"id": p.id, "name": p.name, "price": p.price}
+            for p in products[:5]  # Only send top 5 to LLM (compressed)
+        ]
+    }
 
-@server.tool(requires="results")
-async def act(result_id: str, content: str, state: MyState) -> dict:
-    """Execute action on a previously found result."""
-    target = state.results[result_id]       # Retrieved from server state, not LLM context
-    return await _execute(target, content)
+# 3. This tool requires previous results
+@server.tool(requires="search_results")
+async def buy(product_id: str, state: ShopState) -> dict:
+    """Buy a product from search results. Requires search first."""
+    product = state.search_results[product_id]  # From server cache, not LLM context
+    order = await db.create_order(product)
+    return {"order_id": order.id, "status": "confirmed"}
 ```
 
-**Before**: 14 tools, 9 round trips, LLM relays all data between calls.
-**After**: 3 tools, 3 round trips, server caches data between calls.
+**What changed:**
+- The LLM doesn't store 500 tokens of product data. The server does.
+- `buy` accesses search results directly from server state.
+- If someone calls `buy` without `search`, they get a helpful error instead of a crash.
+
+## Before & After
+
+### Before: Traditional MCP (14 tools, 9 round trips)
+
+```
+Round 1: LLM → list_platforms() → LLM         # "which platforms exist?"
+Round 2: LLM → get_trending("reddit") → LLM   # "what's trending?"
+Round 3: LLM → search("MCP server") → LLM     # "find relevant posts"
+Round 4: LLM → analyze_post(id) → LLM         # "is this post good?"
+Round 5: LLM → get_post(id) → LLM             # "get full content"
+Round 6: LLM → get_comments(id) → LLM         # "get the comments"
+Round 7: LLM → check_rate_limit() → LLM       # "can I still post?"
+Round 8: LLM → preview(content) → LLM         # "dry run"
+Round 9: LLM → write_comment(id, text) → LLM  # "actually post"
+
+Each round: resends 14 tool descriptions (~3,000 tokens) + full conversation history
+Total tool description overhead: 14 × 9 = ~27,000 tokens
+```
+
+### After: Pipeline MCP (3 tools, 3 round trips)
+
+```
+Round 1: LLM → scout("MCP server", ["reddit"]) → LLM
+         Server internally: trending + search + analyze + rank + filter
+         Returns: top 3 opportunities (compressed, ~200 tokens)
+
+Round 2: LLM → draft("opp_1") → LLM
+         Server internally: get_post + get_comments + analyze_tone
+         Uses cached opportunity from scout (server state)
+         Returns: context summary (~300 tokens)
+         LLM generates natural content
+
+Round 3: LLM → strike("opp_1", "comment", "content...") → LLM
+         Server internally: write_comment + record_history
+         Uses cached context from draft (server state)
+         Returns: {"url": "...", "status": "posted"}
+
+Each round: resends 3 tool descriptions (~500 tokens) + conversation history
+Total tool description overhead: 3 × 3 = ~4,500 tokens
+```
+
+**Token savings: ~83% reduction** in tool description overhead alone. Plus the LLM doesn't relay intermediate data between tools.
 
 ## How It Works
 
@@ -60,72 +143,95 @@ async def act(result_id: str, content: str, state: MyState) -> dict:
 ```python
 from mcp_pipeline import State
 
-class ProjectState(State):
-    search_results: dict[str, Any] = {}     # scout → stores here
-    draft_contexts: dict[str, Any] = {}     # draft → stores here
-    action_history: list[dict] = []         # strike → appends here
+class MyState(State):
+    search_results: dict[str, Any] = {}     # Tool A stores here
+    processed_data: dict[str, Any] = {}     # Tool B stores here
+    action_history: list[dict] = []         # Tool C appends here
 ```
 
-No more `ctx.set_state("key", value)` with string keys.
-IDE autocomplete works. Type errors caught at write time.
+**vs FastMCP's built-in state:**
 
-### 2. Declarative Dependencies: `stores` and `requires`
+```python
+# FastMCP — string keys, no type safety, known bugs (#2098)
+await ctx.set_state("search_results", data)
+results = await ctx.get_state("search_results")  # Returns Any, no autocomplete
+
+# mcp-pipeline — typed fields, IDE autocomplete, compile-time checks
+state.search_results = data                        # Type-checked
+results = state.search_results                     # IDE knows the type
+```
+
+### 2. `stores` and `requires` — Declarative Dependencies
 
 ```python
 @server.tool(stores="search_results")
-async def scout(query: str, state: ProjectState) -> dict:
-    """Calling this tool saves results to server state."""
+async def scout(query: str, state: MyState) -> dict:
+    """This tool's return value is automatically saved to state.search_results."""
     ...
 
 @server.tool(requires="search_results")
-async def act(result_id: str, state: ProjectState) -> dict:
-    """This tool needs scout results. Fails gracefully if missing."""
+async def act(result_id: str, state: MyState) -> dict:
+    """This tool needs scout to have run first."""
     ...
 ```
 
-What happens when `requires` isn't satisfied:
+When `requires` isn't met:
 
 ```python
-# LLM calls act() without calling scout() first
-# → Tool doesn't execute
-# → Returns: {"error": "scout를 먼저 호출하세요.", "hint": "scout(query=...)"}
-# → LLM sees this and calls scout first
-# → No wasted API call, no crash
+# LLM calls act() before scout()
+# Instead of crashing or returning garbage:
+{
+    "error": "Required state 'search_results' is empty.",
+    "hint": "Call scout(query=...) first to populate search results.",
+    "required_by": "act"
+}
+# The LLM reads this and knows to call scout first.
+# No wasted API call. No stack trace. Just guidance.
 ```
 
 ### 3. Auto-Generated `_status` Tool
 
-mcp-pipeline automatically registers a status tool:
+Every `PipelineMCP` server automatically gets a `_status` tool:
 
 ```python
-# LLM calls _status() to see current state
+# LLM calls _status()
 {
-    "search_results": {"count": 3, "available": true},
-    "draft_contexts": {"count": 0, "available": false},
-    "action_history": {"count": 2},
-    "available_tools": ["scout", "act"],     # Tools whose requires are met
-    "blocked_tools": ["draft"]               # Tools waiting on dependencies
+    "state": {
+        "search_results": {"populated": true, "count": 5},
+        "processed_data": {"populated": false},
+        "action_history": {"populated": true, "count": 2}
+    },
+    "tools": {
+        "available": ["scout", "act"],       # requires are met
+        "blocked": ["process"]               # waiting on dependencies
+    }
 }
 ```
 
-The LLM always knows what it can do next without guessing.
+The LLM always knows: what data exists, what tools can run, what's blocking.
 
 ### 4. Pipeline Compression
 
-The key insight: **move work from LLM to server**.
+The core design principle: **move orchestration from LLM to server.**
 
 ```
-Traditional MCP (LLM does the orchestration):
-LLM → search       → LLM → filter        → LLM → analyze
-    → LLM → rank   → LLM → get_details   → LLM → execute
+Traditional: LLM orchestrates
+┌─────┐      ┌─────┐      ┌─────┐      ┌─────┐
+│ LLM │─────▶│Tool1│─────▶│ LLM │─────▶│Tool2│───▶ ...
+│     │◀─────│     │◀─────│relay│◀─────│     │◀──
+└─────┘      └─────┘      └─────┘      └─────┘
+  LLM shuttles data between tools (expensive)
 
-Pipeline MCP (server does the orchestration):
-LLM → scout (search+filter+analyze+rank internally) → LLM → act
+Pipeline: Server orchestrates
+┌─────┐      ┌──────────────────────────────┐
+│ LLM │─────▶│ PipelineTool                 │
+│     │◀─────│  internally: Tool1 → Tool2   │
+└─────┘      │  state cached server-side    │
+             └──────────────────────────────┘
+  One call, server handles the rest (cheap)
 ```
 
-Each "pipeline tool" does internally what would otherwise require 3-5 separate tool calls. The LLM sends one request, the server runs the full pipeline.
-
-## Full Example
+## Full Example: Social Media Agent
 
 ```python
 from mcp_pipeline import PipelineMCP, State
@@ -140,75 +246,107 @@ server = PipelineMCP("social-agent", state=SocialState)
 
 @server.tool(stores="opportunities")
 async def scout(topic: str, platforms: list[str] | None = None) -> dict:
-    """Scan platforms for relevant discussions. Returns top opportunities."""
-    # Internally: trending + search + analyze + score + filter
-    results = await _multi_platform_search(topic, platforms)
-    scored = _score_relevance(results, topic)
+    """Scan developer communities for relevant discussions.
+    Internally runs: trending + search + score + filter across all platforms.
+    Returns top opportunities with IDs for follow-up."""
+    all_posts = []
+    for platform in get_active_platforms(platforms):
+        trending = await platform.get_trending()
+        searched = await platform.search(topic)
+        all_posts.extend(trending + searched)
+
+    scored = score_relevance(all_posts, topic)
+    top = scored[:5]
+
     return {
         "opportunities": [
-            {"id": opp.id, "platform": opp.platform,
-             "title": opp.title, "relevance": opp.score,
-             "reason": opp.reason}
-            for opp in scored[:5]
+            {
+                "id": f"opp_{i}",
+                "platform": opp.platform,
+                "title": opp.title[:80],
+                "relevance": round(opp.score, 2),
+                "comments": opp.comment_count,
+                "reason": opp.reason,
+            }
+            for i, opp in enumerate(top)
         ],
-        "summary": f"Found {len(scored)} opportunities, showing top 5",
+        "total_scanned": len(all_posts),
+        "summary": f"{len(top)} opportunities across {len(set(o.platform for o in top))} platforms",
     }
 
 @server.tool(stores="contexts", requires="opportunities")
 async def draft(opportunity_id: str, state: SocialState) -> dict:
-    """Gather context for a specific opportunity."""
+    """Gather full context for a specific opportunity.
+    Reads the post, its comment tree, and analyzes the conversation tone.
+    Returns a context summary for the LLM to craft a response."""
     opp = state.opportunities[opportunity_id]
-    # Internally: get_post + get_comments + analyze_sentiment
-    context = await _gather_context(opp)
+    post = await get_post(opp)
+    comments = await get_comments(opp)
+
     return {
-        "post_title": context.title,
-        "post_summary": context.summary,
-        "top_comments": context.top_comments[:5],
-        "tone": context.tone,
-        "suggested_approach": context.approach,
+        "title": post.title,
+        "body_summary": post.body[:500],
+        "comment_count": len(comments),
+        "top_comments": [c.body[:200] for c in comments[:5]],
+        "tone": analyze_tone(comments),
+        "suggested_approach": suggest_approach(post, comments),
     }
 
 @server.tool(requires="contexts")
 async def strike(
-    opportunity_id: str, action: str, content: str, state: SocialState,
+    opportunity_id: str,
+    action: str,
+    content: str,
+    state: SocialState,
 ) -> dict:
-    """Execute: post a comment, reply, or new post."""
+    """Execute: write a comment, reply, or new post.
+    Uses cached context from draft. Records action in history."""
     ctx = state.contexts[opportunity_id]
-    result = await _write_to_platform(ctx, action, content)
-    state.history.append({"opp": opportunity_id, "action": action, "url": result.url})
+    result = await write_to_platform(ctx, action, content)
+
+    state.history.append({
+        "opportunity": opportunity_id,
+        "action": action,
+        "url": result.url,
+        "timestamp": now(),
+    })
+
     return {"url": result.url, "status": "posted"}
 ```
 
-3 tool calls. 3 round trips. Full workflow.
+3 tools. 3 round trips. Complete workflow from discovery to action.
 
-## Comparison
+## Comparisons
 
 ### vs Raw FastMCP
 
 | | FastMCP | mcp-pipeline |
 |---|---|---|
-| State management | `ctx.set_state("key", val)` string keys | Typed `State` class with IDE support |
-| Dependencies | None — tools are independent | `stores`/`requires` — declarative |
-| Missing dependency | Silent bug or crash | Graceful error + hint message |
-| Status introspection | Manual implementation | Auto-generated `_status` tool |
-| Pipeline pattern | DIY — write orchestration in each tool | Built-in `stores`/`requires` chaining |
+| State API | `ctx.set_state("key", val)` — string keys, `Any` type | `state.field = val` — typed, IDE autocomplete |
+| State bugs | [Known issues](https://github.com/jlowin/fastmcp/issues/2098) with get/set | Built on simple dataclass — predictable |
+| Tool dependencies | None — all tools are independent | `stores`/`requires` — declarative chaining |
+| Missing dependency | Silent failure or crash | Guided error: "call X first" |
+| Status introspection | Build it yourself | Auto-generated `_status` tool |
+| Design philosophy | General-purpose toolkit | Token-efficient pipeline design |
 
-### vs mcp-workflow (TypeScript)
+### vs mcp-workflow
 
-| | mcp-workflow | mcp-pipeline |
+| | [mcp-workflow](https://github.com/P0u4a/mcp-workflow) | mcp-pipeline |
 |---|---|---|
 | Language | TypeScript | **Python** |
-| Approach | Step-based workflows with branching | **Declarative state dependencies** |
+| Approach | Step-based workflow engine | **Declarative state dependencies** |
 | State | `WorkflowSessionManager` (Map) | **Typed State class** |
-| Integration | Own workflow engine | **Extends FastMCP** |
+| Complexity | Workflow DSL, branching, pause/resume | **Minimal API: `stores`/`requires`** |
+| Integration | Own workflow engine | **Wraps FastMCP** |
 
 ### vs mcp-agent
 
-| | mcp-agent | mcp-pipeline |
+| | [mcp-agent](https://github.com/lastmile-ai/mcp-agent) | mcp-pipeline |
 |---|---|---|
 | Focus | Agent orchestration (client-side) | **MCP server design (server-side)** |
+| Problem | "How do I coordinate multiple agents?" | **"How do I reduce tokens per server?"** |
 | State | Conversation history in LLM wrapper | **Server-side typed state** |
-| Goal | Coordinate multiple agents | **Reduce tools & tokens per server** |
+| Output | Multi-agent workflows | **Fewer, smarter tools** |
 
 ## Install
 
@@ -216,35 +354,37 @@ async def strike(
 pip install mcp-pipeline
 ```
 
+Depends only on `mcp[cli]` (FastMCP). No other dependencies.
+
 ## Architecture
 
 ```
 mcp_pipeline/
-├── __init__.py          # PipelineMCP, State exports
-├── server.py            # PipelineMCP class (wraps FastMCP)
-├── state.py             # State base class + serialization
-├── decorators.py        # stores/requires decorator logic
-└── status.py            # Auto-generated _status tool
+├── __init__.py      # PipelineMCP, State exports
+├── server.py        # PipelineMCP (wraps FastMCP, adds state injection)
+├── state.py         # State base class (dataclass-style, field introspection)
+├── decorators.py    # stores/requires logic (validation, auto-save, error guidance)
+└── status.py        # Auto-generated _status tool
 ```
 
 ```
-┌─────────────────────────────────────────────┐
-│  LLM Agent                                  │
-│  Sees: 3-4 tools (not 14)                   │
-│  Does: judgment + content generation         │
-└──────────────┬──────────────────────────────┘
-               │
-┌──────────────▼──────────────────────────────┐
-│  PipelineMCP Server                         │
-│                                             │
-│  ┌─────────┐  ┌─────────┐  ┌────────────┐  │
-│  │  Tool A │─▶│  State  │◀─│   Tool B   │  │
-│  │ stores= │  │ (typed) │  │ requires=  │  │
-│  └─────────┘  └─────────┘  └────────────┘  │
-│                                             │
-│  Does: data fetching, analysis, filtering,  │
-│        caching, pipeline orchestration       │
-└─────────────────────────────────────────────┘
+┌───────────────────────────────────────────────┐
+│  LLM Agent                                    │
+│  Sees: 3-4 tools (not 14)                     │
+│  Does: judgment, content generation            │
+└──────────────┬────────────────────────────────┘
+               │ minimal round trips
+┌──────────────▼────────────────────────────────┐
+│  PipelineMCP Server                           │
+│                                               │
+│  ┌──────────┐  ┌──────────┐  ┌────────────┐  │
+│  │  Tool A  │─▶│  State   │◀─│   Tool B   │  │
+│  │ stores=X │  │  (typed) │  │ requires=X │  │
+│  └──────────┘  └──────────┘  └────────────┘  │
+│                                               │
+│  Server handles: data fetching, analysis,     │
+│  filtering, caching, orchestration            │
+└───────────────────────────────────────────────┘
 ```
 
 ## Development
