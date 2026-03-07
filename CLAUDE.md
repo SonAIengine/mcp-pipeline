@@ -16,7 +16,8 @@ mcp_pipeline/
 ## 핵심 패턴
 
 ### PipelineMCP
-- FastMCP를 래핑 (상속 또는 컴포지션)
+- FastMCP를 래핑 (컴포지션: `self._mcp = FastMCP(...)`)
+- FastMCP import: `from mcp.server.fastmcp import FastMCP` (not `from fastmcp`)
 - `@server.tool(stores="field", requires="field")` 데코레이터 확장
 - State 인스턴스를 모듈 레벨 싱글턴으로 관리
 - _status tool 자동 등록
