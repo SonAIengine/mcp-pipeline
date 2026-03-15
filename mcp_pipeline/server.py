@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import inspect
-from typing import Any, Callable
+from collections.abc import Callable
+from typing import Any
 
 from mcp.server.fastmcp import FastMCP
 
-from .decorators import normalize, wrap_tool
+from .decorators import Transform, normalize, wrap_tool
 from .state import State
 from .status import make_status_fn
 
@@ -60,6 +61,8 @@ class PipelineMCP:
         *,
         stores: str | list[str] | None = None,
         requires: str | list[str] | None = None,
+        store_value: Transform | None = None,
+        return_value: Transform | None = None,
         **kwargs: Any,
     ) -> Any:
         """tool 데코레이터. stores/requires로 상태 의존성 선언.
@@ -89,8 +92,21 @@ class PipelineMCP:
                     sig = inspect.signature(func)
                     if "state" in sig.parameters:
                         needs_wrap = True
+            if store_value is not None or return_value is not None:
+                needs_wrap = True
 
-            wrapped = wrap_tool(func, self._state, stores_list, requires_list) if needs_wrap else func  # type: ignore[arg-type]
+            wrapped = (
+                wrap_tool(
+                    func,
+                    self._state,
+                    stores_list,
+                    requires_list,
+                    store_value=store_value,
+                    return_value=return_value,
+                )
+                if needs_wrap
+                else func
+            )
             self._mcp.tool(**kwargs)(wrapped)
             return func
 

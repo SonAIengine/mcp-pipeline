@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
-import pytest
 from typing import Any
 
-from mcp_pipeline import PipelineMCP, State
+import pytest
 
+from mcp_pipeline import PipelineMCP, State
 
 # ── State 테스트 ──
 
@@ -113,6 +113,29 @@ async def test_stores_saves_to_state():
     tools = server.mcp._tool_manager._tools
     result = await tools["scout"].fn(topic="MCP")
     assert server.state.opportunities == {"opp_1": {"topic": "MCP", "score": 0.9}}
+    assert result == {"opp_1": {"topic": "MCP", "score": 0.9}}
+
+
+@pytest.mark.asyncio
+async def test_stores_can_separate_state_and_response():
+    server = PipelineMCP("test", state=TestState)
+
+    @server.tool(
+        stores="opportunities",
+        store_value=lambda result: result[0],
+        return_value=lambda result: result[1],
+    )
+    async def scout(topic: str, state: TestState) -> tuple[dict[str, Any], dict[str, Any]]:
+        return (
+            {"opp_1": {"topic": topic, "score": 0.9}},
+            {"opportunities": [{"id": "opp_1", "topic": topic}]},
+        )
+
+    tools = server.mcp._tool_manager._tools
+    result = await tools["scout"].fn(topic="MCP")
+
+    assert server.state.opportunities == {"opp_1": {"topic": "MCP", "score": 0.9}}
+    assert result == {"opportunities": [{"id": "opp_1", "topic": "MCP"}]}
 
 
 @pytest.mark.asyncio

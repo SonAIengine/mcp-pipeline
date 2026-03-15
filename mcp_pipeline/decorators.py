@@ -4,9 +4,12 @@ from __future__ import annotations
 
 import functools
 import inspect
-from typing import Any, Callable
+from collections.abc import Callable
+from typing import Any
 
 from .state import State
+
+Transform = Callable[[Any], Any]
 
 
 def normalize(value: str | list[str] | None) -> list[str]:
@@ -20,9 +23,12 @@ def normalize(value: str | list[str] | None) -> list[str]:
 
 def wrap_tool(
     fn: Callable[..., Any],
-    state: State,
+    state: State | None,
     stores: list[str],
     requires: list[str],
+    *,
+    store_value: Transform | None = None,
+    return_value: Transform | None = None,
 ) -> Callable[..., Any]:
     """tool 함수를 래핑하여 상태 주입 + stores/requires 처리."""
     sig = inspect.signature(fn)
@@ -32,7 +38,7 @@ def wrap_tool(
     @functools.wraps(fn)
     async def wrapper(*args: Any, **kwargs: Any) -> Any:
         # requires 검증
-        missing = [r for r in requires if not state._is_populated(r)]
+        missing = [r for r in requires if state is None or not state._is_populated(r)]
         if missing:
             return {
                 "error": f"필수 상태가 비어있습니다: {', '.join(missing)}",
@@ -42,16 +48,21 @@ def wrap_tool(
 
         # state 주입
         if has_state_param:
+            if state is None:
+                raise RuntimeError("State injection requested, but PipelineMCP has no state.")
             kwargs["state"] = state
 
         # 원본 함수 호출
         result = await fn(*args, **kwargs) if is_async else fn(*args, **kwargs)
+        stored_result = store_value(result) if store_value is not None else result
+        response_result = return_value(result) if return_value is not None else result
 
         # 반환값을 state에 저장
-        for field_name in stores:
-            setattr(state, field_name, result)
+        if state is not None:
+            for field_name in stores:
+                setattr(state, field_name, stored_result)
 
-        return result
+        return response_result
 
     # state 파라미터를 시그니처에서 제거 (MCP 스키마에 노출 방지)
     if has_state_param:
